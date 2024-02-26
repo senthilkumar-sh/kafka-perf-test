@@ -4,7 +4,7 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "start": "rm -rf dist && npx tsc && cd dist && node app.js",
+    "start": "rm -rf dist && npx tsc && cd dist && set KAFKAJS_NO_PARTITIONER_WARNING=1 && node app.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "keywords": [],
@@ -13,6 +13,7 @@
   "dependencies": {
     "async": "^3.2.5",
     "express": "^4.18.2",
+    "kafkajs": "^2.2.4",
     "lodash": "^4.17.21",
     "node-worker-threads-pool": "^1.5.1",
     "workerpool": "^9.1.0"
