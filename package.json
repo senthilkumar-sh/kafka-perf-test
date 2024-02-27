@@ -16,6 +16,8 @@
     "kafkajs": "^2.2.4",
     "lodash": "^4.17.21",
     "node-worker-threads-pool": "^1.5.1",
+    "percentile": "^1.6.0",
+    "randomstring": "^1.3.0",
     "workerpool": "^9.1.0"
   },
   "devDependencies": {

@@ -1,9 +1,11 @@
+const _ = require('lodash')
 const async = require('async')
 const worker = require("workerpool")
-const pool = worker.pool("./asyncWorker.js")
-const _ = require('lodash')
-const { Kafka } = require('kafkajs')
+const pool = worker.pool("./asyncWorker")
+const randomstring = require("randomstring");
 const EventEmitter = require('node:events');
+const percentile = require("percentile");
+const { Kafka, CompressionTypes } = require('kafkajs')
 
 const kafka = new Kafka({
   clientId: 'my-app',
@@ -13,70 +15,230 @@ const kafka = new Kafka({
 const producer = kafka.producer()
 const consumer = kafka.consumer({ groupId: 'test-group' })
 const admin = kafka.admin()
-//const workerpool = require("workerpool")
 
 const run = async (qo, cb) => {
-
-    //Executing the workers asynchronously
-    // async.waterfall([
-    //     async.apply(_executeWorkers, qo),
-    //     _constructReport
-    // ], function (err, result) {
-    //     cb(result);
-    // });
-    
     await _executeWorkers(qo)
     await _constructReport(qo)
     cb(qo)
 }
 
 const _executeWorkers = async (qo) => {
+
+    // If topic not provided in request query param
+    if (qo.request.canCreateTopic) {
+        // Create Topic
+        createTopic(qo)
+    }
+
+    try {
+        // Consuming
+        await consumer.connect()
+        await consumer.subscribe({ topic: qo.request.topic, fromBeginning: false })
+
+        // Test start time
+        const start = performance.now();
+
+        // Producer connect
+        await producer.connect()
+
+        // Produce messages
+        await _execute(qo)
+        console.log('counter calc = ', (parseInt(qo.request.totalHits) * parseInt(qo.request.producers)))
+
+        await consumeMessages(1, qo, start)
+
+    } catch (err: any) {
+        console.log('error = ', err.toString())
+        qo.response.error = err.toString()
+    }
+}
+
+const consumeMessages = async (consumerCount, qo, start) => {
     const kafkaEvents = new EventEmitter();
-
-    // Create Topic
-    createTopic(qo)
-    // Producing
-    await producer.connect()
-
-    // for (let i = 1; i <= qo.request.totalHits; i++) {
-    //     await producer.send({
-    //         topic: 'topic_test_1',
-    //         messages: [
-    //         { value: 'Hello KafkaJS user!' },
-    //         ],
-    //     })
-    // }
-
-    await _execute(qo)
-    console.log('counter calc = ', (parseInt(qo.request.totalHits) * parseInt(qo.request.producers)))
     let counter = 1
-    // Consuming
-    await consumer.connect()
-    await consumer.subscribe({ topic: 'topic_test_1', fromBeginning: false })
 
+    // Consumer run receive each messages
     await consumer.run({
         eachMessage: async ({ topic, partition, message }) => {
-            console.log('consumed message')
             kafkaEvents.emit( 'message', message, counter);
-            console.log('consumer counter = ', counter);
-            console.log('message = ', message.value.toString());
+            //console.log('message = ' + message.key + ', Length = ', message.value.toString());
             counter++
         },
     })
+
+    // Promise to handle message from consumer and stop once consumer receives all the messages
     return new Promise((resolve) => {
         const handleMessage = async (message: any, counter: number) => {
-            //console.log('promise counter = ', counter);
-          if ((parseInt(qo.request.totalHits) * parseInt(qo.request.producers)) === counter) {
-            await consumer.stop();
-            await consumer.disconnect();
-            console.log('disconnecting consumer')
-            deleteTopic(qo)
-            resolve(message);
-          }
+
+            if ((parseInt(qo.request.totalHits) * parseInt(qo.request.producers)) === counter) {
+                await consumer.stop();
+                await consumer.disconnect();
+                console.log('disconnecting consumer')
+                
+                // Test end time
+                const end = performance.now();
+
+                qo.response.duration = Math.round(end - start)
+                qo.response.executionTime = new Date().toUTCString()
+                // If topic not provided in request query param
+                if (qo.request.canCreateTopic) {
+                    // Delete topic
+                    //deleteTopic(qo)
+                }
+                resolve(message);
+            }
         };
+
         kafkaEvents.on('message', handleMessage);
     });
 }
+
+const produceMessages = async (producerCount, qo) => {
+    let message = randomstring.generate({
+        length: (parseInt(qo.request.messageSizeKB) * 1000),
+        charset: 'alphabetic'
+      });
+
+    let latencyTime: any = 0
+    let maxLatency = 0
+    let minLatency = 0
+    let producerName = 'Producer' + producerCount
+    let latencies = new Array()
+    const producerStart = performance.now();
+
+    for (let i = 1; i <= qo.request.totalHits; i++) {
+        const start = performance.now();
+
+        await producer.send({
+            topic: qo.request.topic,
+            compression: CompressionTypes.GZIP,
+            messages: [{ 
+                key: 'producer-' + producerCount + '-key',
+                value: 'producer' + producerCount + ' Message'+ i + " - " + message
+            }],
+        })
+
+        const end = performance.now();
+        const currentLatency = (end - start)
+        latencies.push(currentLatency.toFixed(2))
+        latencyTime = latencyTime + currentLatency
+        //console.log('latencyTime = ', latencyTime)
+        if (maxLatency < currentLatency) {
+            maxLatency = currentLatency;
+        }
+
+        if (i == 1) {
+            minLatency = currentLatency
+        } else if (minLatency > currentLatency) {
+            minLatency = currentLatency
+        }
+        //console.log(producerName + ' minLatency per call = ', minLatency)
+    }
+
+    const producerEnd = performance.now();
+
+    let producerTimeTaken = (producerEnd - producerStart)
+    // Calculating percentiles
+    const percentiles = percentile(
+        [90, 95, 99], // calculates 70p, 80p and 90p in one pass
+        latencies
+      );
+
+    // Assigning latency metrics
+    const metrics: any = {}
+    metrics.name = producerName
+    metrics.timeTaken = producerTimeTaken
+    metrics.timeTaken = Math.round(metrics.timeTaken.toFixed(2))
+    const rps = parseFloat((qo.request.totalHits / (metrics.timeTaken / 1000)).toFixed(2))
+    metrics.recordsPerSec = Math.round(rps)
+    const mbs =  (qo.request.totalHits *  (qo.request.messageSizeKB / 1000))
+    const tps = metrics.timeTaken / 1000
+    metrics.throughputMBPerSec = Math.round(mbs / tps)
+
+    const latency: any = {}
+    latency.avg = parseFloat((latencyTime / parseInt(qo.request.totalHits)).toFixed(2))
+    latency.max = parseFloat(maxLatency.toFixed(2))
+    latency.min = parseFloat(minLatency.toFixed(2))
+    latency.p90 = parseFloat(percentiles[0])
+    latency.p95 = parseFloat(percentiles[1])
+    latency.p99 = parseFloat(percentiles[2])
+
+    metrics.latency = latency
+    qo.producerMetrics.push(metrics)
+}
+
+const _execute = async (qo) => {
+    const producers = qo.request.producers
+    const promises = new Array()
+    //_createTopic(qo)
+
+    for (let i = 1; i <= producers; i++) {
+        promises.push(produceMessages(i, qo));
+    }
+
+    console.log('promises = ', promises)
+    worker.Promise.all(promises).then((values => {
+        //_deleteTopic(qo)
+        return qo
+    }));
+}
+
+const _constructReport = async (qo) => {
+    //console.log('qo ', qo.producerMetrics)
+    let maxLatency: number = 0
+    let minLatency: number = 0
+    let averageLatency: number = 0
+    let latencies = new Array()
+    let recordsPerSec: number = 0
+    let throughputMBPerSec: number = 0
+
+    _.forEach(qo.producerMetrics, function(metrics, i) {
+        //console.log(metrics);
+        if (maxLatency < metrics.latency.max) {
+            maxLatency = metrics.latency.max;
+        }
+
+        if (i == 1) {
+            minLatency = metrics.latency.min
+        } else if (minLatency > metrics.latency.min) {
+            minLatency = metrics.latency.min
+        }
+
+        averageLatency = (averageLatency + parseFloat(metrics.latency.avg))
+        console.log('averageLatency = ', averageLatency)
+        recordsPerSec = recordsPerSec + metrics.recordsPerSec
+        throughputMBPerSec = throughputMBPerSec + metrics.throughputMBPerSec
+
+        latencies.push(metrics.latency.p90)
+        latencies.push(metrics.latency.p95)
+        latencies.push(metrics.latency.p99)
+      });
+    let report: any = {}
+    report.status = 'success'
+    report.message = 'Metrics calculated'
+
+    let producerMetrics : any = {}
+    producerMetrics.maxLatency = maxLatency
+    producerMetrics.minLatency = minLatency
+    producerMetrics.avgLatency = parseFloat((averageLatency / qo.request.producers).toFixed(2))
+    producerMetrics.recordsPerSec = (recordsPerSec / qo.request.producers)
+    producerMetrics.throughputMBPerSec = (throughputMBPerSec / qo.request.producers)
+    
+    const percentiles = percentile(
+        [90, 95, 99], // calculates 70p, 80p and 90p in one pass
+        latencies
+      );
+
+    producerMetrics.p90 = parseFloat(percentiles[0])
+    producerMetrics.p95 = parseFloat(percentiles[1])
+    producerMetrics.p99 = parseFloat(percentiles[2])
+
+    qo.response.producerMetrics = producerMetrics
+
+    qo.report = report
+    return qo
+}
+
 
 const createTopic = async (qo) => {
     
@@ -87,7 +249,8 @@ const createTopic = async (qo) => {
         timeout: 20000,
         topics: [{
             topic: qo.request.topic,
-            numPartitions: 4
+            numPartitions: 4,
+            replicationFactor: 1
         }]
     })
     await admin.disconnect()
@@ -106,114 +269,6 @@ const deleteTopic = async (qo) => {
     await admin.disconnect()
 
     return true
-}
-
-const produceMessages = async (producerCount, qo) => {
-    for (let i = 1; i <= qo.request.totalHits; i++) {
-        //console.log('producer' + producerCount + ' counter = ', i);
-        await producer.send({
-            topic: 'topic_test_1',
-            messages: [
-            { value: 'producer' + producerCount + ' Message'+ i},
-            ],
-        })
-    }
-}
-
-const _execute = async (qo) => {
-    const producers = qo.request.producers
-    const promises = new Array()
-    //_createTopic(qo)
-
-    for (let i = 1; i <= producers; i++) {
-        promises.push(produceMessages(i, qo));
-    }
-
-    //promises.push(_consumerPool(1, qo));
-    console.log('promises = ', promises)
-    worker.Promise.all(promises).then((values => {
-        //console.log('values = ', values);
-        //console.log('qo = ', qo);
-        qo.response.result = new Array()
-
-        _.forEach(values, function (value, i) {
-            qo.response.result[i] = value.response
-        });
-        //_deleteTopic(qo)
-        return qo
-    }));
-}
-
-function _createTopic(qo) {
-        pool.exec("createTopic", [qo]).then(result => {
-            return true
-        }).catch(err => {
-            console.log(err);
-            return false
-        }).then(() => {
-            console.log('then topic create done')
-            pool.terminate()
-        })
-}
-
-function _deleteTopic(qo) {
-    pool.exec("deleteTopic", [qo]).then(result => {
-        return true
-    }).catch(err => {
-        console.log(err);
-        return false
-    }).then(() => {
-        console.log('then topic delete done')
-        pool.terminate()
-    })
-}
-
-
-function _producerPool(index, qo) {
-    const promiseObj = new Promise((resolve, reject) => {
-        //console.log('producer pool = ', qo.request.producers)
-        pool.exec("produceMessages", [index, qo], {
-            on: function (payload) {
-                //console.log('status', payload.status);
-            }
-        }).then(result => {
-            //worker.Promise.all(_consumerPool(index, qo)).then((values => {
-                resolve(result)
-            //}));
-        }).catch(err => {
-            console.log(err);
-            reject(resolve);
-        }).then(() => {
-            console.log('then producer done')
-            pool.terminate()
-        })
-    });
-
-    return promiseObj
-}
-
-function _consumerPool(index, qo) {
-    const promiseObj = new Promise((resolve, reject) =>  {
-        pool.exec("consumeMessages", [index, qo]).then(result => {
-            //setTimeout(resolve(result), 1000)
-            setTimeout(function() { resolve(result); }, 10000);
-            //resolve(result)
-        }).catch(err => {
-            console.log(err);
-            reject(resolve);
-        }).then(() => {
-            console.log('then consumer done')
-            pool.terminate()
-        })
-    });
-
-    return promiseObj
-}
-
-const _constructReport = async (params) => {
-    params.report = 'done'
-    //callback(null, params);
-    return params
 }
 
 exports.run = run;
